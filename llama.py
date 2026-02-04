@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file
 
+import kernels
+
 
 @dataclasses.dataclass
 class ModelConfig:
@@ -40,11 +42,13 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, input):
-        return (
-            input
-            * torch.rsqrt(input.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-            * self.weight
-        )
+        # return (
+        #     input
+        #     * torch.rsqrt(input.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        #     * self.weight
+        # )
+        # 替换为 Triton 实现的 RMSNorm
+        return kernels.rms_norm_triton(input, self.weight, self.eps)
 
 
 class MLP(nn.Module):
@@ -132,16 +136,30 @@ class Attention(nn.Module):
         key_states = self.k_proj(hidden_states).view(hidden_shape)
         value_states = self.v_proj(hidden_states).view(hidden_shape).permute(0, 2, 1, 3)
 
-        query_states = apply_rotary_position_embedding(
-            query_states, sin_table, cos_table
-        ).permute(0, 2, 1, 3)
-        key_states = apply_rotary_position_embedding(
-            key_states, sin_table, cos_table
-        ).permute(0, 2, 1, 3)
+        # query_states = apply_rotary_position_embedding(
+        #     query_states, sin_table, cos_table
+        # ).permute(0, 2, 1, 3)
+        # key_states = apply_rotary_position_embedding(
+        #     key_states, sin_table, cos_table
+        # ).permute(0, 2, 1, 3)
+        # 使用 Triton 实现的 Rotary Embedding
+        kernels.apply_rotary_pos_emb_triton(query_states, cos_table, sin_table)
+        kernels.apply_rotary_pos_emb_triton(key_states, cos_table, sin_table)
 
-        attn_output = apply_scaled_dot_product_attention(
-            query_states, key_states, value_states
-        )
+        query_states = query_states.permute(0, 2, 1, 3)
+        key_states = key_states.permute(0, 2, 1, 3)
+        # attn_output = apply_scaled_dot_product_attention(
+        #     query_states, key_states, value_states
+        # )
+        # 使用 Triton 实现的 Flash Attention
+        _, num_heads_q, seq_len_q, emb_dim = query_states.shape
+        _, num_heads_k, seq_len_k, _ = key_states.shape
+        _, num_heads_v, _, _ = value_states.shape
+
+        key_states = key_states.repeat_interleave(num_heads_q // num_heads_k, 1)
+        value_states = value_states.repeat_interleave(num_heads_q // num_heads_v, 1)
+
+        attn_output = kernels.flash_attention_triton(query_states, key_states, value_states)
 
         return self.o_proj(
             attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
