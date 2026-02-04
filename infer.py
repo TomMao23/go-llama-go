@@ -53,7 +53,10 @@ if __name__ == "__main__":
     num_profiling_iterations = args.num_profiling_iterations
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-
+    # 设置padding token，对于Llama模型通常使用eos_token作为pad_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
     inputs = tokenizer(prompts, padding=True, return_tensors="pt").to(device)
 
     model = llama.ModelForCausalLM.from_pretrained(model_path).to(device)
