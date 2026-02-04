@@ -9,61 +9,61 @@ def _rms_norm_kernel(
     N_COLS, eps,
     BLOCK_SIZE: tl.constexpr
 ):
-    # 当前处理的行号
+    # Current row index
     row_idx = tl.program_id(0)
     
-    # 计算当前行的起始指针
+    # Calculate start pointers for the current row
     row_start_ptr = X_ptr + row_idx * stride_x_row
     out_row_start_ptr = Out_ptr + row_idx * stride_y_row
     
-    # 生成列的偏移量
+    # Generate column offsets
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < N_COLS
     
-    # 加载数据和权重，为了精度使用 float32 进行计算
+    # Load data and weights, use float32 for precision
     x_val = tl.load(row_start_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     w_val = tl.load(W_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     
-    # RMSNorm 计算逻辑
-    # 1. 计算均方值
+    # RMSNorm computation logic
+    # 1. Calculate mean square
     x_sq = x_val * x_val
     mean_sq = tl.sum(x_sq, axis=0) / N_COLS
     
-    # 2. 计算 rstd (reciprocal standard deviation)
+    # 2. Calculate rstd (reciprocal standard deviation)
     rstd = tl.rsqrt(mean_sq + eps)
     
-    # 3. 归一化并应用 gamma 权重
+    # 3. Normalize and apply gamma weight
     y_val = x_val * rstd * w_val
     
-    # 写回显存
+    # Write back to memory
     tl.store(out_row_start_ptr + offsets, y_val, mask=mask)
 
 def rms_norm_triton(x, weight, eps):
-    # 将输入展平为 (Total_Rows, Hidden_Size)
-    # 比如 (Batch, Seq_Len, Hidden) -> (Batch * Seq_Len, Hidden)
+    # Flatten input to (Total_Rows, Hidden_Size)
+    # e.g., (Batch, Seq_Len, Hidden) -> (Batch * Seq_Len, Hidden)
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
     
-    # 确保输入是连续的
+    # Ensure input is contiguous
     if not x.is_contiguous():
         x = x.contiguous()
     
-    # 展平以便获取正确的 stride
+    # Flatten to get correct strides
     x_flat = x.view(-1, N)
     
-    # 分配输出空间
+    # Allocate output space
     y = torch.empty_like(x)
     
-    # 计算 Block Size，向上取整到最近的 2 的幂次
+    # Calculate Block Size, round up to next power of 2
     BLOCK_SIZE = triton.next_power_of_2(N)
     
-    # Grid 维度：按照行数并行
+    # Grid dimensions: parallelize over rows
     grid = (M,)
     
     _rms_norm_kernel[grid](
         x, weight, y,
-        x_flat.stride(0),  # 输入的行 stride
-        x_flat.stride(0),  # 输出的行 stride (通常和输入一样)
+        x_flat.stride(0),  # Input row stride
+        x_flat.stride(0),  # Output row stride (usually same as input)
         N, eps,
         BLOCK_SIZE=BLOCK_SIZE
     )
@@ -78,80 +78,80 @@ def _rotary_kernel(
     BLOCK_SIZE: tl.constexpr
 ):
     """
-    实现旋转位置编码(Rotary Positional Encoding)的核心内核函数
-    
-    该函数对输入张量应用旋转位置编码变换，这是Transformer模型中一种重要的位置编码方法。
-    通过将相邻维度配对并应用旋转变换，能够更好地捕捉序列中的相对位置信息。
-    
-    参数:
-        X_ptr: 输入张量指针，形状为[batch, seq_len, num_heads, head_dim]
-        Cos_ptr: 余弦值表指针，形状为[seq_len, head_dim//2]
-        Sin_ptr: 正弦值表指针，形状为[seq_len, head_dim//2]
-        stride_x_batch: 输入张量批次维度步长
-        stride_x_seq: 输入张量序列维度步长
-        stride_x_head: 输入张量注意力头维度步长
-        stride_x_dim: 输入张量维度步长
-        stride_c_seq: Cos/Sin表序列维度步长
-        stride_c_dim: Cos/Sin表维度步长
-        HEAD_DIM: 注意力头维度大小
-        BLOCK_SIZE: 处理块大小，用于并行计算优化
-        
-    返回值:
-        无返回值，直接在原地修改输入张量X_ptr
+    Core kernel function for Rotary Positional Encoding (RoPE).
+
+    This function applies rotary positional encoding transformation to the input tensor.
+    By pairing adjacent dimensions and applying rotation, it captures relative position information in the sequence.
+
+    Args:
+        X_ptr: Pointer to input tensor, shape [batch, seq_len, num_heads, head_dim]
+        Cos_ptr: Pointer to cosine table, shape [seq_len, head_dim//2]
+        Sin_ptr: Pointer to sine table, shape [seq_len, head_dim//2]
+        stride_x_batch: Stride for batch dimension of input tensor
+        stride_x_seq: Stride for sequence dimension of input tensor
+        stride_x_head: Stride for head dimension of input tensor
+        stride_x_dim: Stride for dimension of input tensor
+        stride_c_seq: Stride for sequence dimension of Cos/Sin table
+        stride_c_dim: Stride for dimension of Cos/Sin table
+        HEAD_DIM: Size of the head dimension
+        BLOCK_SIZE: Block size for parallel computation optimization
+
+    Returns:
+        None, modified in-place
     """
-    # 网格结构: (批次, 序列, 注意力头)
+    # Grid structure: (Batch, Seq, Heads)
     batch_id = tl.program_id(0)
     seq_id = tl.program_id(1)
     head_id = tl.program_id(2)
 
-    # 计算当前注意力头的偏移量
+    # Calculate offsets for the current head
     x_offset = (
         batch_id * stride_x_batch +
         seq_id * stride_x_seq +
         head_id * stride_x_head
     )
     
-    # Cos/Sin仅依赖于序列位置(和维度)
+    # Cos/Sin depend only on sequence position (and dim)
     c_offset = seq_id * stride_c_seq
     
-    # 旋转位置编码作用于注意力头维度的一半配对
+    # RoPE applies to pairs in the head dimension
     HALF_DIM = HEAD_DIM // 2
     
-    # 我们并行处理范围[0, HALF_DIM)
+    # Process range [0, HALF_DIM) in parallel
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < HALF_DIM
 
-    # 指向注意力头向量两个部分的指针
-    # 通常最后一个维度是连续的所以stride_x_dim为1，但为了通用性我们使用stride
-    # 索引方式: x[..., i] 和 x[..., i + HALF_DIM]
+    # Pointers to the two halves of the head vector
+    # Usually last dim is contiguous (stride=1), but use stride for generality
+    # Indexing: x[..., i] and x[..., i + HALF_DIM]
     x0_ptr = X_ptr + x_offset + offsets * stride_x_dim
     x1_ptr = X_ptr + x_offset + (offsets + HALF_DIM) * stride_x_dim
     
     c_ptr = Cos_ptr + c_offset + offsets * stride_c_dim
-    s_ptr = Sin_ptr + c_offset + offsets * stride_c_dim # Sin表与Cos表布局相同
+    s_ptr = Sin_ptr + c_offset + offsets * stride_c_dim # Sin table has same layout as Cos
     
-    # 加载数据
+    # Load data
     x0 = tl.load(x0_ptr, mask=mask, other=0.0).to(tl.float32)
     x1 = tl.load(x1_ptr, mask=mask, other=0.0).to(tl.float32)
     c = tl.load(c_ptr, mask=mask, other=0.0).to(tl.float32)
     s = tl.load(s_ptr, mask=mask, other=0.0).to(tl.float32)
     
-    # 应用旋转变换
+    # Apply rotation transformation
     # x0_new = x0 * cos - x1 * sin
     # x1_new = x0 * sin + x1 * cos
     y0 = x0 * c - x1 * s
     y1 = x0 * s + x1 * c
     
-    # 存储回原位置(原地操作)
+    # Store back to original location (in-place)
     tl.store(x0_ptr, y0, mask=mask)
     tl.store(x1_ptr, y1, mask=mask)
 
 def apply_rotary_pos_emb_triton(x, cos, sin):
     # x: (Batch, Seq, Heads, Dim)
     # cos, sin: (Seq, Dim/2)
-    # We perform the operation in-place on x.
+    # We perform the operation in-place on x
     
-    # Handle input continuity
+    # Ensure input is contiguous
     if not x.is_contiguous():
         x = x.contiguous()
     if not cos.is_contiguous():
@@ -229,7 +229,7 @@ def _flash_attn_fwd_kernel(
         order=(1, 0)
     )
     
-    # Initialize output accumulator and statistics
+    # Initialize
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
@@ -282,7 +282,7 @@ def _flash_attn_fwd_kernel(
         # Update statistics
         m_i = m_i_new
         
-        # Advance pointers
+        # Advance pointers 
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
 
@@ -291,7 +291,7 @@ def _flash_attn_fwd_kernel(
     # l_i should be > 0 if any attention was valid.
     acc = acc / l_i[:, None]
     
-    # Store output
+    # Store Output
     O_block_ptr = tl.make_block_ptr(
         base=Out + o_offset,
         shape=(N_CTX, BLOCK_DMODEL),
@@ -304,22 +304,21 @@ def _flash_attn_fwd_kernel(
 
 def flash_attention_triton(q, k, v):
     # q, k, v: (Batch, Heads, Seq_Len, Dim)
-    # They should be on CUDA and contiguous
     
     # Shape checks
     B, H, S, D = q.shape
     
-    # Ensure inputs are contiguous
+    # Ensure contiguous
     if not q.is_contiguous(): q = q.contiguous()
     if not k.is_contiguous(): k = k.contiguous()
     if not v.is_contiguous(): v = v.contiguous()
        
-    # Tuning block sizes
+    # block sizes
     BLOCK_M = 128
     BLOCK_N = 64
     
     # Grid
-    # We parallelize over (Seq_Len // BLOCK_M, Batch, Heads)
+    # Parallelize over (Seq_Len // BLOCK_M, Batch, Heads)
     grid = (triton.cdiv(S, BLOCK_M), B, H)
     
     scale = 1.0 / (D ** 0.5)

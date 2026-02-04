@@ -47,7 +47,7 @@ class RMSNorm(nn.Module):
         #     * torch.rsqrt(input.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         #     * self.weight
         # )
-        # 替换为 Triton 实现的 RMSNorm
+        # Replaced with Triton implementation of RMSNorm
         return kernels.rms_norm_triton(input, self.weight, self.eps)
 
 
@@ -142,7 +142,7 @@ class Attention(nn.Module):
         # key_states = apply_rotary_position_embedding(
         #     key_states, sin_table, cos_table
         # ).permute(0, 2, 1, 3)
-        # 使用 Triton 实现的 Rotary Embedding
+        # Use Triton implementation of Rotary Embedding
         kernels.apply_rotary_pos_emb_triton(query_states, cos_table, sin_table)
         kernels.apply_rotary_pos_emb_triton(key_states, cos_table, sin_table)
 
@@ -151,7 +151,7 @@ class Attention(nn.Module):
         # attn_output = apply_scaled_dot_product_attention(
         #     query_states, key_states, value_states
         # )
-        # 使用 Triton 实现的 Flash Attention
+        # Use Triton implementation of Flash Attention
         _, num_heads_q, seq_len_q, emb_dim = query_states.shape
         _, num_heads_k, seq_len_k, _ = key_states.shape
         _, num_heads_v, _, _ = value_states.shape
