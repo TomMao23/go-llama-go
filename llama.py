@@ -146,13 +146,6 @@ class Attention(nn.Module):
         key_slice = qkv[..., q_dim : q_dim + kv_dim]
         value_slice = qkv[..., q_dim + kv_dim :]
 
-        # Fused RoPE (+ permute to [B, H, S, D]) in one kernel; theta holds
-        # the per-dim frequencies matching the baseline tables bit-for-bit.
-        query_states, key_states = tk.rope(
-            query_slice, key_slice, self.theta,
-            self.num_attention_heads, self.num_key_value_heads,
-        )
-
         # Strided [B, Hkv, S, D] view over the v slice for the attention kernel.
         value_states = torch.as_strided(
             value_slice,
@@ -165,7 +158,7 @@ class Attention(nn.Module):
             # single-block softmax design: fall back to the reference path.
             sin_table, cos_table = generate_sin_and_cos_tables(
                 seq_len, self.head_dim, base=self.rope_theta,
-                dtype=query_states.dtype, device=hidden_states.device,
+                dtype=query_slice.dtype, device=hidden_states.device,
             )
             query_states = apply_rotary_position_embedding(
                 query_slice.reshape(batch_size, seq_len, -1, self.head_dim),
@@ -182,9 +175,12 @@ class Attention(nn.Module):
                 attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
             )
 
-        # Fused causal flash attention with native GQA; the output is stored
-        # in [B, S, H * D] layout, ready for o_proj without any permute/copy.
-        attn_output = tk.flash_attn(query_states, key_states, value_states)
+        # Fused RoPE + causal flash attention with native GQA in one kernel;
+        # the output lands in [B, S, H * D] layout, ready for o_proj.
+        attn_output = tk.flash_attn(
+            query_slice, key_slice, self.theta, value_states,
+            self.num_attention_heads, self.num_key_value_heads,
+        )
 
         return self.o_proj(attn_output)
 
@@ -288,7 +284,7 @@ class ModelForCausalLM(nn.Module):
 
             logits = self.lm_head(hidden_states[:, -1, :])
 
-            next = torch.argmax(logits, dim=-1).unsqueeze(-1)
+            next = tk.argmax(logits).unsqueeze(-1)
 
             input_ids = torch.cat((input_ids, next), dim=-1)
 
