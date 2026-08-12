@@ -59,8 +59,9 @@ class MLP(nn.Module):
 
     def forward(self, input):
         # gate_up_proj is the fused gate+up GEMM built by
-        # ModelForCausalLM.fuse_projections.
-        return self.down_proj(tk.swiglu(self.gate_up_proj(input)))
+        # ModelForCausalLM.fuse_projections; tk.linear dispatches it to the
+        # tuned Triton skinny GEMM for this workload's small-M regime.
+        return tk.linear(tk.swiglu(tk.linear(input, self.gate_up_proj.weight)), self.down_proj.weight)
 
 
 def apply_rotary_position_embedding(input, sin_table, cos_table):
@@ -137,9 +138,10 @@ class Attention(nn.Module):
     def forward(self, hidden_states):
         batch_size, seq_len = hidden_states.shape[:2]
 
-        # One fused q/k/v GEMM; the q/k/v slices are consumed as strided
-        # views, so no intermediate copy is needed.
-        qkv = self.qkv_proj(hidden_states)
+        # One fused q/k/v GEMM (Triton skinny GEMM in the small-M regime);
+        # the q/k/v slices are consumed as strided views, so no intermediate
+        # copy is needed.
+        qkv = tk.linear(hidden_states, self.qkv_proj.weight)
         q_dim = self.num_attention_heads * self.head_dim
         kv_dim = self.num_key_value_heads * self.head_dim
         query_slice = qkv[..., :q_dim]

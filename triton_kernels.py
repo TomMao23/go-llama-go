@@ -395,3 +395,120 @@ def argmax(logits):
     _argmax_kernel[(rows,)](x_2d, idx, n, x_2d.stride(0), BLOCK=8192, num_warps=8)
     return idx.view(logits.shape[:-1])
 
+
+# ---------------------------------------------------------------------------
+# Skinny GEMM (A [M,K] @ W^T [K,N]) tuned for the small-M regime of this
+# workload (M = batch * seq grows ~64..192). cuBLAS underutilizes the GPU on
+# these shapes; per-(N,K) tile/split-K configs were tuned on device.
+# Shapes without a tuned config, or M outside the tuned range, fall back to
+# cuBLAS via F.linear.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _skinny_gemm_kernel(
+    A, B, C, WS,
+    M, N: tl.constexpr, K,
+    sam, sak, sbk, sbn, scm, scn, sws,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    GROUP_M: tl.constexpr, SPLIT_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    num_pid_m = tl.cdiv(M, BM)
+    num_pid_n = N // BN
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k = pid_k * BK + tl.arange(0, BK)
+
+    a_ptrs = A + offs_m[:, None] * sam + offs_k[None, :] * sak
+    b_ptrs = B + offs_k[:, None] * sbk + offs_n[None, :] * sbn
+
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for _ in range(0, tl.cdiv(K, SPLIT_K * BK)):
+        a = tl.load(a_ptrs, mask=offs_m[:, None] < M, other=0.0)
+        b = tl.load(b_ptrs)
+        acc += tl.dot(a, b)
+        a_ptrs += SPLIT_K * BK * sak
+        b_ptrs += SPLIT_K * BK * sbk
+
+    if SPLIT_K == 1:
+        c_ptrs = C + offs_m[:, None] * scm + offs_n[None, :] * scn
+        tl.store(c_ptrs, acc.to(C.dtype.element_ty), mask=offs_m[:, None] < M)
+    else:
+        ws_ptrs = WS + pid_k.to(tl.int64) * sws + offs_m[:, None] * N + offs_n[None, :]
+        tl.store(ws_ptrs, acc, mask=offs_m[:, None] < M)
+
+
+@triton.jit
+def _gemm_reduce_kernel(WS, C, TOTAL, SCK, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < TOTAL
+
+    acc = tl.load(WS + offs, mask=mask, other=0.0)
+    for k in range(1, SCK):
+        acc += tl.load(WS + k.to(tl.int64) * TOTAL + offs, mask=mask, other=0.0)
+
+    tl.store(C + offs, acc.to(C.dtype.element_ty), mask=mask)
+
+
+# (N, K) -> (BM, BN, BK, SPLIT_K, num_warps, num_stages, min_M for the
+# Triton path). Tuned on RTX 5090 against cuBLAS for M in ~64..192.
+_GEMM_CONFIGS = {
+    (16384, 2048): (64, 64, 64, 1, 8, 3, 0),     # fused gate+up projection
+    (2048, 8192): (64, 128, 64, 4, 8, 3, 112),   # down projection
+    (4096, 2048): (64, 64, 64, 4, 8, 3, 160),    # fused q/k/v projection
+}
+_TRITON_GEMM_MAX_M = 256
+
+
+def linear(x, weight):
+    """x @ weight.T, dispatching to the tuned Triton skinny GEMM for the
+    small-M shapes of this workload and to cuBLAS (F.linear) otherwise."""
+    shape = x.shape
+    k = shape[-1]
+    x_2d = x.reshape(-1, k)
+    m = x_2d.shape[0]
+    n = weight.shape[0]
+
+    cfg = _GEMM_CONFIGS.get((n, k))
+    if cfg is None or m < cfg[6] or m > _TRITON_GEMM_MAX_M:
+        return torch.nn.functional.linear(x, weight)
+
+    bm, bn, bk, split_k, num_warps, num_stages, _ = cfg
+    out = _buf(f"gemm_{n}_{k}", (m, n), x.dtype, x.device)
+
+    if split_k == 1:
+        ws = out  # unused
+        sws = 0
+    else:
+        ws = _buf(f"gemm_ws_{n}_{k}", (split_k * m * n,), torch.float32, x.device)
+        sws = m * n
+
+    grid = (triton.cdiv(m, bm) * (n // bn), split_k)
+    _skinny_gemm_kernel[grid](
+        x_2d, weight, out, ws,
+        m, N=n, K=k,
+        sam=x_2d.stride(0), sak=x_2d.stride(1),
+        sbk=weight.stride(1), sbn=weight.stride(0),
+        scm=out.stride(0), scn=out.stride(1), sws=sws,
+        BM=bm, BN=bn, BK=bk, GROUP_M=8, SPLIT_K=split_k,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+    if split_k > 1:
+        total = m * n
+        block = 1024
+        _gemm_reduce_kernel[(triton.cdiv(total, block),)](
+            ws, out, total, SCK=split_k, BLOCK=block, num_warps=4,
+        )
+
+    return out.view(shape[:-1] + (n,))
+
